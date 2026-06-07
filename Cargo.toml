@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "iqdb-ivf"
-version = "0.1.0"
+version = "1.0.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.87"
@@ -46,7 +46,8 @@ documentation = "https://docs.rs/iqdb-ivf"
 
 # Authors
 authors = [
-    "James Gober <me@jamesgober.com>"
+    "James Gober <me@jamesgober.com>",
+    "Matt Callahan <matthewcallahan01@icloud.com>"
 ]
 
 [package.metadata.docs.rs]
@@ -58,30 +59,35 @@ name = "iqdb_ivf"
 path = "src/lib.rs"
 
 
-# FEATURE FLAGS
-# #################################
-[features]
-default = ["std"]
-# Standard library.
-std = []
-# Serialization support.
-serde = ["dep:serde"]
-
-
 # DEPENDENCIES
 # #################################
 [dependencies]
-serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
+# Shared iQDB vocabulary: VectorId, Metadata, Hit, SearchParams, DistanceMetric, IqdbError.
+iqdb-types    = "1.0.0"
+# Centroid + candidate distance kernels (SIMD where the target allows it).
+iqdb-distance = "1.0.0"
+# The Index / IndexCore traits this crate implements.
+iqdb-index    = "1.0.0"
+# Metadata pre-filter evaluation (closed-world semantics, validated depth/IN caps).
+iqdb-filter   = "1.0.0"
+# Product quantization for the IVF-PQ variant: codebook training, encoding,
+# and the `PqAdcTables` query-side ADC primitive.
+iqdb-quantize = "1.0.0"
+# `ForgeError` trait: `kind()` / `caption()` on `IqdbError` for structured
+# error-event fields on the tracing instrumentation boundary.
+error-forge   = "1.0.0"
+# Tracing facade only. Instrumented at the insert/delete/search boundary;
+# the per-entry scan stays free of any tracing call.
+tracing       = { version = "0.1", default-features = false, features = ["attributes", "std"] }
 
 
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
+# FlatIndex is the exact-search recall oracle for the correctness tests.
+iqdb-flat = "1.0.0"
 criterion = { version = "0.5", features = ["html_reports"] }
-proptest = "1"
-
-[target.'cfg(loom)'.dev-dependencies]
-loom = "0.7"
+proptest  = "1"
 
 
 # BENCHMARKS
