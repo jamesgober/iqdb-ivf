@@ -10,9 +10,10 @@
 //!
 //! Two variants share one surface. **IVF-Flat** (the default) stores
 //! vectors verbatim and scores probed clusters exactly. **IVF-PQ**
-//! (`use_pq = true`) compresses each vector to a Product-Quantization code
+//! (`use_pq = true`) also encodes each vector to a Product-Quantization code
 //! and scores by asymmetric distance (ADC), optionally exact-reranking a
-//! shortlist against the retained vectors. Both honour metadata filters and
+//! shortlist against the retained vectors. The full vectors stay stored for
+//! that rerank, so IVF-PQ speeds up the scan but does not shrink memory. Both honour metadata filters and
 //! the same `smaller-is-nearer` ordering contract as every other iQDB index.
 //!
 //! ## Tiered API
