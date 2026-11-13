@@ -18,6 +18,12 @@ use iqdb_types::{IqdbError, Result};
 /// happens at construction.
 const DEFAULT_N_CLUSTERS: usize = 256;
 
+/// Largest accepted [`IvfConfig::n_clusters`]. The index allocates one
+/// list per cluster up front, and a centroid table this size is already
+/// far past any practical k-means; the cap stops a corrupt or hostile
+/// config from exhausting memory at construction.
+const MAX_N_CLUSTERS: usize = 1 << 20;
+
 /// Default number of clusters probed at query time.
 ///
 /// `8` of `256` is a strong recall/latency baseline for the FAISS-style
@@ -79,7 +85,9 @@ pub struct IvfConfig {
     /// produces.
     ///
     /// Spec heuristic: `sqrt(N)` for moderate corpora, `4 * sqrt(N)`
-    /// for very large ones. Must be at least `1`. Default `256`.
+    /// for very large ones. Must be in `1..=1_048_576` (`2^20`); the
+    /// index reserves one list per cluster at construction. Default
+    /// `256`.
     pub n_clusters: usize,
 
     /// Number of clusters searched at query time.
@@ -213,6 +221,11 @@ impl IvfConfig {
         if self.n_clusters == 0 {
             return Err(IqdbError::InvalidConfig {
                 reason: "IvfConfig.n_clusters must be greater than zero",
+            });
+        }
+        if self.n_clusters > MAX_N_CLUSTERS {
+            return Err(IqdbError::InvalidConfig {
+                reason: "IvfConfig.n_clusters must be at most 2^20",
             });
         }
         if self.n_probes == 0 {

@@ -400,7 +400,15 @@ impl IvfIndex {
     /// - Propagates errors from the internal k-means trainer, the
     ///   PQ trainer, and
     ///   [`iqdb_quantize::Quantizer::quantize`] when the snapshot
-    ///   fails the same shape checks `train` would.
+    ///   fails the same shape checks `train` would. The most common
+    ///   one is [`IqdbError::InvalidConfig`] when fewer vectors are
+    ///   stored than `n_clusters` (or than the 256 an IVF-PQ codebook
+    ///   needs).
+    ///
+    /// The new model is trained and every entry's new cluster and code
+    /// are computed before anything is moved, so on any error the
+    /// index is left exactly as it was: every vector stays stored and
+    /// searchable under the old centroids.
     ///
     /// On an empty trained index (`len() == 0`), `retrain` is a
     /// no-op and returns `Ok(())`; the centroids stay as they were
@@ -418,30 +426,21 @@ impl IvfIndex {
             return Ok(());
         }
 
-        // -- 1. Snapshot all entries; reset bookkeeping ---------------
-        let mut snapshot: Vec<InvertedListEntry> = Vec::with_capacity(self.live_count);
-        for list in self.inverted_lists.iter_mut() {
-            let taken = std::mem::take(list);
-            for entry in taken {
-                snapshot.push(entry);
-            }
-        }
-        // Restore empty per-cluster Vecs so search-pass indexing
-        // stays unconditional during the reassign loop below.
-        debug_assert!(self.inverted_lists.iter().all(|l| l.is_empty()));
-        self.id_to_cluster.clear();
-        self.live_count = 0;
+        // Everything up to the commit step only reads the index, so an
+        // error from k-means, PQ training, or re-encoding returns with
+        // the old centroids, codebooks, and lists untouched.
 
-        // -- 2. Order by seq for delete-pattern determinism ----------
+        // -- 1. Order entries by seq for delete-pattern determinism --
+        let mut snapshot: Vec<&InvertedListEntry> = self.inverted_lists.iter().flatten().collect();
         snapshot.sort_by_key(|e| e.seq);
 
-        // -- 3. Build the capped working-set refs --------------------
+        // -- 2. Build the capped working-set refs --------------------
         let all_refs: Vec<&[f32]> = snapshot.iter().map(|e| e.vector_slice()).collect();
         let target_len = self.cfg.training_sample_size.min(all_refs.len());
         let mut rng = SplitMix64::new(self.cfg.seed);
         let capped: Vec<&[f32]> = subsample_refs(&all_refs, target_len, &mut rng);
 
-        // -- 4. Train k-means on the capped sample -------------------
+        // -- 3. Train k-means on the capped sample -------------------
         // Pass `training_sample_size = capped.len()` so the
         // `train_kmeans` internal subsample is a no-op — k-means and
         // the PQ retrain below must see *the same* working set
@@ -454,32 +453,53 @@ impl IvfIndex {
             capped.len(),
         )?;
         debug_assert_eq!(centroids.len(), self.cfg.n_clusters);
-        self.centroids = centroids;
 
-        // -- 5. Retrain the PQ codebooks on the same capped sample ---
-        if self.cfg.use_pq {
-            let pq = pq_variant::train_pq(&self.cfg, &capped)?;
-            self.pq = Some(pq);
+        // -- 4. Retrain the PQ codebooks on the same capped sample ---
+        let pq = if self.cfg.use_pq {
+            Some(pq_variant::train_pq(&self.cfg, &capped)?)
+        } else {
+            None
+        };
+
+        // -- 5. Plan every entry's new cluster and code --------------
+        // In seq order, parallel to `snapshot`.
+        let mut plan: Vec<(usize, Option<PqCode>)> = Vec::with_capacity(snapshot.len());
+        for entry in &snapshot {
+            let cluster = assign_to_cluster(&centroids, entry.vector_slice());
+            let code = match pq.as_ref() {
+                Some(q) => Some(q.quantize(entry.vector_slice())?),
+                None => None,
+            };
+            plan.push((cluster, code));
         }
+        drop(capped);
+        drop(all_refs);
+        drop(snapshot);
 
-        // -- 6. Reassign + re-encode every entry ---------------------
-        // The snapshot is iterated in seq-sorted order; the original
-        // `seq` stamp on each entry is preserved so the top-k
-        // tiebreaker invariants stay stable across the retrain.
-        for mut entry in snapshot {
-            let cluster = assign_to_cluster(&self.centroids, &entry.vector);
-            if let Some(pq) = self.pq.as_ref() {
-                // Re-encode against the freshly-trained codebooks.
-                // The old `PqCode` is dropped as part of this
-                // assignment.
-                entry.pq_code = Some(pq.quantize(&entry.vector)?);
+        // -- 6. Commit: move every entry to its planned cluster ------
+        // The original `seq` stamp on each entry is preserved so the
+        // top-k tiebreaker invariants stay stable across the retrain.
+        let mut entries: Vec<InvertedListEntry> = std::mem::take(&mut self.inverted_lists)
+            .into_iter()
+            .flatten()
+            .collect();
+        entries.sort_by_key(|e| e.seq);
+        let mut lists: Vec<Vec<InvertedListEntry>> = Vec::with_capacity(self.cfg.n_clusters);
+        lists.resize_with(self.cfg.n_clusters, Vec::new);
+        self.id_to_cluster.clear();
+        for (mut entry, (cluster, code)) in entries.into_iter().zip(plan) {
+            if pq.is_some() {
+                // The old `PqCode` is dropped as part of this assignment.
+                entry.pq_code = code;
             }
-            let id = entry.id.clone();
-            let _prev = self.id_to_cluster.insert(id, cluster);
-            self.inverted_lists[cluster].push(entry);
-            self.live_count += 1;
+            let _prev = self.id_to_cluster.insert(entry.id.clone(), cluster);
+            lists[cluster].push(entry);
         }
-
+        self.inverted_lists = lists;
+        self.centroids = centroids;
+        if pq.is_some() {
+            self.pq = pq;
+        }
         Ok(())
     }
 
@@ -680,11 +700,39 @@ impl IvfIndex {
     }
 }
 
+/// Log a failed operation. Errors a caller causes and can act on (a
+/// duplicate or unknown id, a wrong dimension, metric or filter, an
+/// untrained index) go to `debug`, so retries and probes do not flood the
+/// error log; anything else is logged at `error`. No event carries the
+/// vector id, which may be a user key.
+fn log_failure(op: &'static str, err: &IqdbError) {
+    match err {
+        IqdbError::Duplicate
+        | IqdbError::NotFound
+        | IqdbError::DimensionMismatch { .. }
+        | IqdbError::InvalidVector
+        | IqdbError::InvalidMetric
+        | IqdbError::InvalidFilter
+        | IqdbError::InvalidConfig { .. } => tracing::debug!(
+            op,
+            error.kind = err.kind(),
+            error.reason = err.caption(),
+            "ivf operation rejected",
+        ),
+        _ => tracing::error!(
+            op,
+            error.kind = err.kind(),
+            error.reason = err.caption(),
+            "ivf operation failed",
+        ),
+    }
+}
+
 impl IndexCore for IvfIndex {
     #[tracing::instrument(
         level = "debug",
         skip_all,
-        fields(vector_id = %id, n = self.live_count, dim = self.dim),
+        fields(n = self.live_count, dim = self.dim),
     )]
     fn insert(
         &mut self,
@@ -695,11 +743,7 @@ impl IndexCore for IvfIndex {
         match self.insert_inner(id, vector, metadata) {
             Ok(()) => Ok(()),
             Err(err) => {
-                tracing::error!(
-                    error.kind = err.kind(),
-                    error.reason = err.caption(),
-                    "ivf insert failed",
-                );
+                log_failure("insert", &err);
                 Err(err)
             }
         }
@@ -708,17 +752,13 @@ impl IndexCore for IvfIndex {
     #[tracing::instrument(
         level = "debug",
         skip_all,
-        fields(vector_id = %id, n = self.live_count),
+        fields(n = self.live_count),
     )]
     fn delete(&mut self, id: &VectorId) -> Result<()> {
         match self.delete_inner(id) {
             Ok(()) => Ok(()),
             Err(err) => {
-                tracing::error!(
-                    error.kind = err.kind(),
-                    error.reason = err.caption(),
-                    "ivf delete failed",
-                );
+                log_failure("delete", &err);
                 Err(err)
             }
         }
@@ -739,11 +779,7 @@ impl IndexCore for IvfIndex {
         match self.search_inner(query, params) {
             Ok(hits) => Ok(hits),
             Err(err) => {
-                tracing::error!(
-                    error.kind = err.kind(),
-                    error.reason = err.caption(),
-                    "ivf search failed",
-                );
+                log_failure("search", &err);
                 Err(err)
             }
         }

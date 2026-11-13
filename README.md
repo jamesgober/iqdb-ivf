@@ -21,7 +21,7 @@
         <strong>iqdb-ivf</strong> partitions the vector space into clusters with deterministic k-means and searches only the few clusters nearest each query. It is the complement to a graph index: more memory-efficient at very large scale and with more predictable latency, because every query probes the same fixed number of clusters.
     </p>
     <p>
-        Two variants share one surface. <strong>IVF-Flat</strong> stores vectors verbatim and scans probed clusters exactly. <strong>IVF-PQ</strong> compresses each vector to a Product-Quantization code, scores by asymmetric distance, and optionally exact-reranks a shortlist &mdash; trading a little accuracy for a large drop in memory and scan cost.
+        Two variants share one surface. <strong>IVF-Flat</strong> stores vectors verbatim and scans probed clusters exactly. <strong>IVF-PQ</strong> adds a Product-Quantization code to each vector, scores by asymmetric distance, and optionally exact-reranks a shortlist &mdash; trading a little accuracy for a much cheaper scan. It keeps the full vectors for that rerank, so it uses a little more memory than IVF-Flat, not less.
     </p>
     <br>
     <hr>
@@ -39,7 +39,7 @@
 <h2>What it does</h2>
 
 - **Inverted-file index** &mdash; deterministic k-means partitions the space; each query scans only the `n_probes` nearest clusters
-- **IVF-Flat and IVF-PQ** &mdash; store vectors as-is for exact intra-cluster scoring, or compress them with Product Quantization for huge-scale memory savings
+- **IVF-Flat and IVF-PQ** &mdash; store vectors as-is for exact intra-cluster scoring, or score compact Product-Quantization codes for a much cheaper scan
 - **Predictable latency** &mdash; a fixed probe count means deterministic query cost; IVF never widens the probe set behind your back
 - **Deterministic** &mdash; same seed + same data → byte-identical centroids on every platform; one *smaller-is-nearer* ordering across all five metrics with a stable insertion-order tiebreaker
 - **Trainable + retrainable** &mdash; rebuild clusters as the distribution drifts, without losing data
@@ -105,10 +105,12 @@ in [`docs/API.md`](./docs/API.md).
 ## IVF-Flat vs IVF-PQ
 
 IVF-Flat keeps the raw vectors and scores probed clusters exactly. IVF-PQ
-compresses each vector to an `M`-byte Product-Quantization code and scores by
+also encodes each vector to an `M`-byte Product-Quantization code and scores by
 asymmetric distance (ADC); with a non-zero refine factor it shortlists by ADC
 and exact-reranks against the retained vectors, recovering most of the accuracy
-at a fraction of the scan cost and memory. Switch variants with one config flag
+at a fraction of the scan cost. The raw vectors stay in memory for the rerank,
+so IVF-PQ costs `M` bytes per vector on top of IVF-Flat rather than replacing
+the vectors. Switch variants with one config flag
 (Product Quantization needs at least 256 training vectors):
 
 ```rust
@@ -233,7 +235,7 @@ seed flows into the codebook trainer, so search results are reproducible too.
 
 ## Status
 
-`v1.0.0` is **stable**: k-means training, IVF-Flat and IVF-PQ search,
+`v1.0.1` is **stable**: k-means training, IVF-Flat and IVF-PQ search,
 metadata-filtered search, `retrain`, probe tuning, and the full
 `Index` / `IndexCore` trait implementation are committed under the SemVer 1.x
 guarantee — no breaking changes until 2.0. The surface is covered by unit,

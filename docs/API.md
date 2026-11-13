@@ -144,7 +144,7 @@ pub struct IvfConfig {
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `n_clusters` | `256` | Number of k-means partitions (inverted lists). Spec heuristic: `sqrt(N)` for moderate corpora, `4·sqrt(N)` for very large. Must be ≥ 1. |
+| `n_clusters` | `256` | Number of k-means partitions (inverted lists). Spec heuristic: `sqrt(N)` for moderate corpora, `4·sqrt(N)` for very large. Must be in `1..=2^20` (one list per cluster is reserved at construction). |
 | `n_probes` | `8` | Clusters scanned per query. Higher → higher recall, higher latency. Must be ≥ 1 and ≤ `n_clusters`. |
 | `training_sample_size` | `65_536` | Cap on the k-means training sample; larger samples are deterministically subsampled down. Must be ≥ 1. |
 | `use_pq` | `false` | Enable IVF-PQ (Product Quantization within clusters). |
@@ -168,7 +168,7 @@ Each `with_*` consumes and returns `self`, so they chain.
 **`validate(&self) -> Result<()>`** — called automatically by
 [`IvfIndex::new`](#ivfindex--construction). Returns
 `IqdbError::InvalidConfig { reason }` naming the failing check
-(`n_clusters == 0`, `n_probes == 0`, `n_probes > n_clusters`,
+(`n_clusters == 0`, `n_clusters > 2^20`, `n_probes == 0`, `n_probes > n_clusters`,
 `training_sample_size == 0`, or `use_pq` without a valid
 `pq_subvectors`). The `m | dim` divisibility check and the metric guard
 run later, in [`IvfIndex::new`](#ivfindex--construction), where `dim` and
@@ -281,8 +281,11 @@ delete-heavy phase or a distribution shift, when
   seed + same history → byte-identical result.
 - **Complexity:** the training stages stay `O(training_sample_size)`;
   reassign/re-encode touches every entry.
-- **Errors:** `IqdbError::InvalidConfig` if not yet trained. An empty
-  trained index is a no-op returning `Ok(())`.
+- **Errors:** `IqdbError::InvalidConfig` if not yet trained, or if the
+  stored vectors cannot train the model (fewer than `n_clusters`, or fewer
+  than 256 for IVF-PQ). The new model and every entry's new cluster and code
+  are computed before anything moves, so on any error the index is left
+  exactly as it was. An empty trained index is a no-op returning `Ok(())`.
 
 **`is_trained(&self) -> bool`** — `true` once `train` has produced
 centroids.
@@ -613,13 +616,23 @@ the seed plus the insert/delete history.
 - **Two-pass search.** Pass 1 ranks all `n_clusters` centroids exactly;
   Pass 2 scans only the `n_probes` nearest clusters. Query cost is
   predictable and roughly `O(n_clusters + n_probes · n/n_clusters)`.
+- **Clusters are built in L2.** k-means and assignment always use squared
+  L2. Pass 1 ranks centroids by the index metric, except under `Hamming`,
+  where it uses squared L2 too: a centroid is a mean and almost never
+  matches a query bit for bit, so Hamming would rank every centroid the
+  same. Under `DotProduct` and `Cosine` on vectors whose norms vary widely,
+  the best matches do not always sit in the clusters nearest the query,
+  so recall at a given `n_probes` is lower than under `Euclidean`.
+  Normalize such vectors first, or raise `n_probes`.
 - **`n_probes` is the dial.** It trades recall for latency without ever
   widening behind your back — latency stays predictable.
 - **Filter-first.** A metadata filter is evaluated before distance, so a
   selective predicate skips distance work proportionally.
-- **IVF-PQ.** Compresses each vector to `M` bytes and scores by ADC from a
+- **IVF-PQ.** Encodes each vector to `M` bytes and scores by ADC from a
   per-query lookup table built once and reused across probes; the optional
-  exact refine reranks an `N·k` shortlist against the retained vectors.
+  exact refine reranks an `N·k` shortlist against the retained vectors. The
+  full vectors stay stored for that rerank, so IVF-PQ makes the scan cheaper
+  but holds the codes on top of the vectors rather than in place of them.
 - **Zero-copy payloads.** Inserted `Arc<[f32]>` values are stored verbatim;
   the index shares one allocation with the caller's record store.
 - All distance math is delegated to `iqdb_distance::compute_batch`, which

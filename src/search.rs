@@ -8,10 +8,21 @@
 //! 1. **Centroid ranking.** Score the query against every centroid
 //!    via [`iqdb_distance::compute_batch`] and pick the
 //!    [`crate::IvfConfig::n_probes`] indices with the smallest
-//!    distance under the configured metric. Centroid distances are
+//!    distance under the configured metric. The one exception is
+//!    [`DistanceMetric::Hamming`]: centroids are means, so they almost
+//!    never match a query component bit for bit and every centroid
+//!    would score the same; Hamming indexes rank centroids by squared
+//!    L2, the space vectors are assigned in. Centroid distances are
 //!    always exact — IVF-PQ does **not** quantize centroids. The
 //!    filter is intentionally not applied at the centroid pass:
 //!    filters live on entries, not on cluster centres.
+//!
+//!    Clusters are always built and assigned by L2, so for
+//!    [`DistanceMetric::DotProduct`] and [`DistanceMetric::Cosine`] on
+//!    vectors whose norms vary widely, the nearest centroid under the
+//!    search metric is not always the cluster that holds the best
+//!    matches, and recall at a given `n_probes` is lower than under
+//!    Euclidean. Normalize the vectors first, or raise `n_probes`.
 //! 2. **Intra-cluster scan.**
 //!    - **IVF-Flat** (default): exact `compute_batch` over every
 //!      stored vector in each probed list, collect into a flat
@@ -61,6 +72,7 @@ use iqdb_distance::compute_batch;
 use iqdb_filter::FilterEvaluator;
 use iqdb_types::{DistanceMetric, Hit, IqdbError, Result, SearchParams};
 
+use crate::assign::squared_l2;
 use crate::index::{InvertedListEntry, IvfIndex};
 use crate::pq_variant;
 use crate::topk::select_topk_indices;
@@ -116,6 +128,17 @@ pub(crate) fn ivf_search(
     if matches!(index.metric(), DistanceMetric::DotProduct) {
         for d in centroid_dists.iter_mut() {
             *d = -*d;
+        }
+    }
+    if matches!(index.metric(), DistanceMetric::Hamming) {
+        // A centroid is a mean, so its components almost never equal a
+        // query component bit for bit and every centroid scores close to
+        // `dim` under Hamming: the ranking would pick the same clusters
+        // for every query. Rank by squared L2 instead, the space the
+        // vectors were assigned in (for 0/1 vectors squared L2 to a point
+        // is exactly the Hamming distance).
+        for (d, c) in centroid_dists.iter_mut().zip(centroids.iter()) {
+            *d = squared_l2(c, query);
         }
     }
 

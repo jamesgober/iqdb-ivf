@@ -8,13 +8,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Added
-
-### Changed
+Planned as 1.0.1. No API changes.
 
 ### Fixed
 
+- `retrain()` lost every stored vector when training failed. It emptied the
+  inverted lists before training, so too few live vectors for `n_clusters`
+  (or for the 256 an IVF-PQ codebook needs) returned `InvalidConfig` with
+  the index left empty. The new model and every entry's new cluster and
+  code are now computed first, and nothing moves until all of it succeeds.
+- Hamming indexes probed the same clusters for every query. Centroids are
+  means, so they almost never match a query component bit for bit and every
+  centroid scored about `dim`. Hamming indexes now rank centroids by squared
+  L2, the space vectors are assigned in (for 0/1 vectors that is the
+  Hamming distance to a point). Recall@10 at 4 of 32 probes on random
+  64-bit codes went from 0.11 to 0.48.
+- A NaN distance with its sign bit set ranked as the best match. Every NaN
+  now ranks after every number.
+- Routine caller errors (a duplicate or unknown id, a wrong dimension,
+  metric, or filter, an untrained index) were logged at `error` level with
+  the vector id. They are now logged at `debug`, and no event carries the
+  id, which may be a user key.
+- The docs claimed IVF-PQ cuts memory. It keeps the full vectors for the
+  exact rerank, so it makes the scan cheaper but stores the codes on top of
+  the vectors. The README and API docs now say so.
+- The docs now note that clusters are built in L2, so `DotProduct` and
+  `Cosine` on vectors with widely varying norms have lower recall at a given
+  `n_probes` than `Euclidean`.
+
 ### Security
+
+- `IvfConfig::validate` (and so `IvfIndex::new`) now rejects `n_clusters`
+  above `2^20`. The index reserves one list per cluster at construction, so
+  an unbounded value from a corrupt config could exhaust memory.
 
 ---
 
